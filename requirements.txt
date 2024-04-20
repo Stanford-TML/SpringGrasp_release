@@ -1,0 +1,9 @@
+numpy
+scipy
+matplotlib
+torch
+pybullet
+open3d
+numpy-quaternion
+
+

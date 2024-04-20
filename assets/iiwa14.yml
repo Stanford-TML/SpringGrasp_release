@@ -1,0 +1,102 @@
+##
+## Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+##
+## NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+## property and proprietary rights in and to this material, related
+## documentation and any modifications thereto. Any use, reproduction,
+## disclosure or distribution of this material and related documentation
+## without an express license agreement from NVIDIA CORPORATION or
+## its affiliates is strictly prohibited.
+##
+
+collision_spheres:
+    lbr_iiwa_link_0:
+        - "center": [0.1, 0.0, 0.0]
+          "radius": 0.10
+        - "center": [0.0, 0.03, 0.05]
+          "radius": 0.05
+        - "center": [0.0, -0.03, 0.05]
+          "radius": 0.05
+        - "center": [0.0, 0.03, 0.0]
+          "radius": 0.05
+        - "center": [0.0, -0.03, 0.0]
+          "radius": 0.05
+    lbr_iiwa_link_1:
+        - "center": [0.0, 0.05, -0.1]
+          "radius": 0.08
+        - "center": [0.0, -0.0, 0.0]
+          "radius": 0.07
+        - "center": [0.0, -0.0, 0.08]
+          "radius": 0.08
+    lbr_iiwa_link_2:
+        - "center": [0.0, -0.05, -0.05]
+          "radius": 0.08
+        - "center": [0.0, -0.03, 0.01]
+          "radius": 0.07
+        - "center": [0.0, 0.05, -0.02]
+          "radius": 0.07
+        - "center": [0.0, 0.13, -0.05]
+          "radius": 0.08
+    lbr_iiwa_link_3:
+        - "center": [0.0, -0.03, -0.07]
+          "radius": 0.08
+        - "center": [0.0, 0.03, 0.01]
+          "radius": 0.07
+        - "center": [0.0, 0.02, 0.07]
+          "radius": 0.07
+    lbr_iiwa_link_4:
+        - "center": [0.0, -0.06, -0.03]
+          "radius": 0.08
+        - "center": [0.0, -0.06, 0.02]
+          "radius": 0.07
+        - "center": [0.0, 0.01, 0.02]
+          "radius": 0.06
+        - "center": [0.0, 0.05, 0.0]
+          "radius": 0.06
+        - "center": [0.0, 0.09, -0.02]
+          "radius": 0.07
+    lbr_iiwa_link_5:
+        - "center": [0.0, -0.03, -0.05]
+          "radius": 0.08
+        - "center": [0.0, 0.0, 0.0]
+          "radius": 0.06
+        - "center": [0.0, 0.05, 0.06]
+          "radius": 0.05
+    lbr_iiwa_link_6:
+        - "center": [0.0, -0.03, -0.06]
+          "radius": 0.06
+        - "center": [0., -0.03, -0.01]
+          "radius": 0.08
+        - "center": [0., -0.07, 0.025]
+          "radius": 0.06
+        - "center": [0., 0.05, 0.0]
+          "radius": 0.065
+        - "center": [0., 0.13, 0.0]
+          "radius": 0.05
+    hand_root:
+        - "center": [0., 0.03, 0.0]
+          "radius": 0.03
+        - "center": [0., -0.03, 0.0]
+          "radius": 0.03
+        - "center": [0.08, 0.0, -0.07]
+          "radius": 0.02
+        - "center": [0.08, -0.07, -0.07]
+          "radius": 0.02
+        - "center": [0.08, 0.07, -0.07]
+          "radius": 0.02
+        - "center": [0.06, 0.0, -0.05]
+          "radius": 0.02
+        - "center": [0.06, -0.06, -0.05]
+          "radius": 0.02
+        - "center": [0.06, 0.06, -0.05]
+          "radius": 0.02
+        - "center": [0.05, 0.0, -0.03]
+          "radius": 0.02
+        - "center": [0.05, -0.05, -0.03]
+          "radius": 0.02
+        - "center": [0.05, 0.05, -0.03]
+          "radius": 0.02
+        - "center": [-0.06, -0.03, -0.05]
+          "radius": 0.02
+        - "center": [-0.07, -0.04, -0.03]
+          "radius": 0.02
