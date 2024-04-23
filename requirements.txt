@@ -5,5 +5,6 @@ torch
 pybullet
 open3d
 numpy-quaternion
+cvxpylayers
 
 

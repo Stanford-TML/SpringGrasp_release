@@ -130,7 +130,7 @@ if __name__ == "__main__":
     if args.hand == "leap": # Not supported in the paper.
         robot_urdf = "assets/leap_hand/robot.urdf"
     elif args.hand == "allegro": # Used in the paper
-        robot_urdf = "allegro_hand/allegro_hand_description_left.urdf"
+        robot_urdf = "assets/allegro_hand/allegro_hand_description_left.urdf"
 
     if args.mode == "fc":
         grasp_optimizer = optimizers[args.mode](robot_urdf,
