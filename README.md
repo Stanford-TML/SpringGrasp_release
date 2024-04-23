@@ -1,6 +1,6 @@
 # SpringGrasp
+### [Website](https://stanford-tml.github.io/SpringGrasp) [Paper](https://arxiv.org/abs/2404.13532)
 ## Synthesizing Compliant, Dexterous Grasp under Shape Uncertainty
-[Website](https://stanford-tml.github.io/SpringGrasp) [Paper](https://arxiv.org/abs/2404.13532)
 Optimization based compliant grasp synthesis using only single depth image. 
 
 ## Installation
