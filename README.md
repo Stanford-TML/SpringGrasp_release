@@ -82,3 +82,16 @@ python verify_grasp_robot.py --exp_name <obj_name>
 ```
 ### Using customized scene and deploy on hardware
 How to deploy on hardware varies case by case, if you need help with using Kuka iiwa14 + allegro hand or run into troubles with coordinate system convention please contact: ericcsr [at] stanford [dot] edu
+
+## Citation
+If you find our code useful, please cite the following
+```
+@misc{chen2024springgrasp,
+      title={SpringGrasp: An optimization pipeline for robust and compliant dexterous pre-grasp synthesis}, 
+      author={Sirui Chen and Jeannette Bohg and C. Karen Liu},
+      year={2024},
+      eprint={2404.13532},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO}
+}
+```
