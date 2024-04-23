@@ -1,6 +1,7 @@
 # SpringGrasp
 ## Synthesizing Compliant, Dexterous Grasp under Shape Uncertainty
-Optimization based compliant grasp synthesis using only single depth image.
+[Website](https://stanford-tml.github.io/SpringGrasp) [Paper](https://arxiv.org/abs/2404.13532)
+Optimization based compliant grasp synthesis using only single depth image. 
 
 ## Installation
 ### Install basic python dependencies
