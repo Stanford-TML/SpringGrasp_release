@@ -1,4 +1,0 @@
-# ninja log v5
-1	2733	1704069322843696284	/home/ericcsr/ComplianceDex/thirdparty/TorchSDF/build/temp.linux-x86_64-cpython-38/torchsdf/csrc/unbatched_triangle_distance.o	3c57f05fdb16cb96
-1	6683	1704069326795780018	/home/ericcsr/ComplianceDex/thirdparty/TorchSDF/build/temp.linux-x86_64-cpython-38/torchsdf/csrc/unbatched_triangle_distance_cuda.o	2b11bf30422ec384
-0	8765	1704069328871824009	/home/ericcsr/ComplianceDex/thirdparty/TorchSDF/build/temp.linux-x86_64-cpython-38/torchsdf/csrc/bindings.o	c483e7b9a96c0d88
