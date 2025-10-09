@@ -1,0 +1,11 @@
+LICENSE
+README.md
+setup.py
+torchsdf.egg-info/PKG-INFO
+torchsdf.egg-info/SOURCES.txt
+torchsdf.egg-info/dependency_links.txt
+torchsdf.egg-info/not-zip-safe
+torchsdf.egg-info/top_level.txt
+torchsdf/csrc/bindings.cpp
+torchsdf/csrc/unbatched_triangle_distance.cpp
+torchsdf/csrc/unbatched_triangle_distance_cuda.cu

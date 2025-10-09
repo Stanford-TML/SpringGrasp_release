@@ -1,0 +1,4 @@
+# ninja log v5
+1	3421	1759979302178862341	/home/ericcsr/robot_imitation/SpringGrasp_release/thirdparty/TorchSDF/build/temp.linux-x86_64-cpython-310/torchsdf/csrc/unbatched_triangle_distance.o	e03a543492d219cd
+0	10673	1759979309431902512	/home/ericcsr/robot_imitation/SpringGrasp_release/thirdparty/TorchSDF/build/temp.linux-x86_64-cpython-310/torchsdf/csrc/bindings.o	3f00611cf0177e4d
+1	12243	1759979310994911173	/home/ericcsr/robot_imitation/SpringGrasp_release/thirdparty/TorchSDF/build/temp.linux-x86_64-cpython-310/torchsdf/csrc/unbatched_triangle_distance_cuda.o	c950e224fcc5fd51
