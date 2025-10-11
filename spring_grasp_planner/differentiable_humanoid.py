@@ -1,7 +1,7 @@
 import os
 import torch 
 import numpy as np
-import rotation_conversions as tRot
+from .rotation_conversions import quaternion_to_matrix, matrix_to_quaternion, axis_angle_to_quaternion, wxyz_to_xyzw, euler_angles_to_axis_angle
 import xml.etree.ElementTree as ETree
 from easydict import EasyDict
 import scipy.ndimage.filters as filters
@@ -41,8 +41,38 @@ G1_ROTATION_AXIS = torch.tensor([[
     [0.0, 0.0, 1.0], # r_wrist_yaw 29
     ]]) # Need re indexing
 
+JOINT_NAMES = ["left_hip_pitch",
+               "left_hip_roll",
+               "left_hip_yaw",
+               "left_knee",
+               "left_ankle_pitch",
+               "left_ankle_roll",
+               "right_hip_pitch",
+               "right_hip_roll",
+               "right_hip_yaw",
+               "right_knee",
+               "right_ankle_pitch",
+               "right_ankle_roll",
+               "waist_yaw",
+               "waist_roll",
+               "torso",
+               "left_shoulder_pitch",
+               "left_shoulder_roll",
+               "left_shoulder_yaw",
+               "left_elbow",
+               "left_wrist_roll",
+               "left_wrist_pitch",
+               "left_wrist_yaw",
+               "right_shoulder_pitch",
+               "right_shoulder_roll",
+               "right_shoulder_yaw",
+               "right_elbow",
+               "right_wrist_roll",
+               "right_wrist_pitch",
+               "right_wrist_yaw"]
 
-class Humanoid_Batch:
+
+class HumanoidModel:
 
     def __init__(self, mjcf_file = f"{current_file_directory}/../assets/g1/g1_29dof_rev_1_0.xml", 
                  extend_hand = False, extend_toe=False, extend_palm=False, extend_head = False,  device = torch.device("cpu")):
@@ -92,8 +122,13 @@ class Humanoid_Batch:
             
         
         self.joints_range = mjcf_data['joints_range'].to(device)
-        self._local_rotation_mat = tRot.quaternion_to_matrix(self._local_rotation).float() # w, x, y ,z
+        self._local_rotation_mat = quaternion_to_matrix(self._local_rotation).float() # w, x, y ,z
         
+    @staticmethod
+    def names_to_indices(names):
+        return [JOINT_NAMES.index(name) for name in names]
+    
+
     def from_mjcf(self, path):
         # function from Poselib: 
         tree = ETree.parse(path)
@@ -152,8 +187,8 @@ class Humanoid_Batch:
             pose = torch.cat([pose, torch.zeros(B, seq_len, 1, 3).to(device).type(dtype)], dim = -2) # adding hand and head joints ???
 
         if convert_to_mat:
-            pose_quat = tRot.axis_angle_to_quaternion(pose)
-            pose_mat = tRot.quaternion_to_matrix(pose_quat)
+            pose_quat = axis_angle_to_quaternion(pose)
+            pose_mat = quaternion_to_matrix(pose_quat)
         else:
             pose_mat = pose
         if pose_mat.shape != 5:
@@ -165,7 +200,7 @@ class Humanoid_Batch:
         return_dict = EasyDict()
         
         
-        wbody_rot = tRot.wxyz_to_xyzw(tRot.matrix_to_quaternion(wbody_mat))
+        wbody_rot = wxyz_to_xyzw(matrix_to_quaternion(wbody_mat))
         if self.extend_hand:
             return_dict.global_translation_extend = wbody_pos.clone()
             return_dict.global_rotation_mat_extend = wbody_mat.clone()
@@ -216,13 +251,15 @@ class Humanoid_Batch:
         rotations_world = torch.cat(rotations_world, dim=2)
         return positions_world, rotations_world
     
-    def forward_kinematics(self, q, root_pos, root_rot):
+    def compute_forward_kinematics(self, q, root_pos, root_rot):
         """
-        q: in axis-angle representation [B, J, 3]
+        q: in axis-angle representation [B, J]
         root_pos: [B, 3]
         root_rot: in euler angles [B,3]
+        output: link positions [B, J, 3]
         """
-        root_aa = tRot.euler_angles_to_axis_angle(root_rot, convention='XYZ')
+        root_aa = euler_angles_to_axis_angle(root_rot, convention='XYZ')
+        q = q[:,:, None] * G1_ROTATION_AXIS.to(q.device)
         pose_aa = torch.cat([root_aa[:, None], q], dim=1)
         return self.fk_batch(pose_aa[:,None,:,:], root_pos[:, None,:])["global_translation"].squeeze(1)
 
@@ -233,15 +270,15 @@ class Humanoid_Batch:
     
 
 if __name__ == "__main__":
-    humanoid = Humanoid_Batch()
+    humanoid = HumanoidModel()
     #pose_aa = torch.zeros(1, 1, 30, 3)
     root_pos = torch.zeros(1, 3).requires_grad_(True)
     root_rot = torch.zeros(1, 3).requires_grad_(True)
-    q = torch.zeros(1, 29, 3).requires_grad_(True)
+    q = torch.zeros(1, 29).requires_grad_(True)
 
-    out = humanoid.forward_kinematics(q, root_pos, root_rot)
+    out = humanoid.compute_forward_kinematics(q, root_pos, root_rot)
     loss = out.sum()
     loss.backward()
-    print(out.shape)
+    print(out)
     print(q.grad)
 

@@ -4,6 +4,7 @@ import torch
 import time
 from functools import partial
 from differentiable_robot_model.robot_model import DifferentiableRobotModel
+from .differentiable_humanoid import HumanoidModel
 from utils.math_utils import minimum_wrench_reward, euler_angles_to_matrix
 
 from .initial_guesses import *
@@ -605,6 +606,121 @@ class FCGPISGraspOptimizer:
         print(task_cost_flag)
         opt_margin[~task_cost_flag] = -1.0 # Ensure that if task cost is not zero, margin is negative.
         return opt_tip_pose, opt_compliance, opt_target_pose, opt_palm_poses, opt_margin, opt_joint_angle
+
+class HumanoidOptimizer:
+    def __init__(self,
+                 eef_link_names=["left_wrist_yaw", "right_wrist_yaw"],
+                 foot_link_names = ["left_ankle_roll", "right_ankle_roll"],
+                 loss_weights = {"reg": 10.0, "foot": 100.0, "eef": 50.0},
+                 num_iters=200,
+                 ref_q=None):
+        self.ref_q = torch.tensor(ref_q).to(device)
+        self.eef_ids = HumanoidModel.names_to_indices(eef_link_names)
+        self.foot_ids = HumanoidModel.names_to_indices(foot_link_names)
+        self.robot_model = HumanoidModel()
+        self.loss_weights = loss_weights
+        self.num_iters = num_iters
+
+    def forward_kinematics(self, joint_angles, root_pos, root_rot):
+        """
+        :params: joint_angles: [num_envs, num_dofs]
+        :params: root_pos: [num_envs, 3]
+        :params: root_ori: [num_envs, 3] euler angles
+        :return: tip_poses: [num_envs * num_fingers, 3]
+        """
+        if joint_angles.dim() == 1:
+            joint_angles = joint_angles.unsqueeze(0)
+            root_pos = root_pos.unsqueeze(0)
+            root_rot = root_rot.unsqueeze(0)
+        link_poses = self.robot_model.compute_forward_kinematics(joint_angles, root_pos, root_rot)
+        eef_pos = link_poses[:,self.eef_ids,:]
+        foot_pos = link_poses[:,self.foot_ids,:]
+        return eef_pos, foot_pos
+    
+    def reg_loss(self, joint_angles):
+        return (joint_angles - self.ref_q).norm(dim=1)
+    
+    def foot_ground_loss(self, foot_pos):
+        return foot_pos[:,:,2].abs().sum(dim=1)
+    
+    def eef_loss(self, eef_pos, target_eef_pos):
+        return (eef_pos - target_eef_pos).norm(dim=2).sum(dim=1)
+
+    # assume all_tip_pose has same shape as target_pose
+    def compute_loss(self, joint_angles, foot_pos, eef_pos, target_eef_pos):
+        reg_cost = self.reg_loss(joint_angles) * self.loss_weights["reg"]
+        foot_cost = self.foot_ground_loss(foot_pos) *  self.loss_weights["foot"]
+        eef_cost = self.eef_loss(eef_pos, target_eef_pos) * self.loss_weights["eef"]
+        total_cost = reg_cost + foot_cost + eef_cost
+        return total_cost
+        
+        
+
+    def closure(self, joint_angles, root_pos, root_rot, target_eef_pos, num_envs):
+        self.optim.zero_grad()
+        
+        self.eef_pos, self.foot_pos = self.forward_kinematics(joint_angles, root_pos, root_rot)
+    
+        
+        # Compute expected loss
+        total_loss = self.compute_loss(joint_angles, self.foot_pos, self.eef_pos, target_eef_pos)
+        self.total_loss = total_loss.float()
+        loss = total_loss.sum()
+        loss.backward()
+        return loss
+
+    def optimize(self, init_joint_angles, target_pose, verbose=True):
+        """
+        NOTE: scale matters in running optimization, need to normalize the scale
+        Params:
+        joint_angles: [num_envs, num_dofs]
+        target_pose: [num_envs, num_eefs, 3]
+        opt_mask: [num_envs, num_fingers]
+        """
+        joint_angles = init_joint_angles.clone().requires_grad_(True)
+        root_pos = torch.zeros(init_joint_angles.shape[0], 3).float().to(device)
+        root_pos[:,2] = 0.8
+        root_pos.requires_grad_(True)
+        root_rot = torch.zeros(init_joint_angles.shape[0], 3).float().to(device).requires_grad_(True)
+        target_eef_pos = target_pose.clone().to(device)
+        params_list = [{"params":joint_angles, "lr":1e-2},
+                       ]
+        params_list.append({"params":root_pos, "lr":1e-3})
+        params_list.append({"params":root_rot, "lr":1e-3})
+
+        self.optim = torch.optim.AdamW(params_list)
+
+        num_envs = init_joint_angles.shape[0]
+        opt_joint_angle = init_joint_angles.clone()
+        opt_value = torch.inf * torch.ones(num_envs).float().to(device)
+        opt_root_pos = root_pos.clone()
+        opt_root_rot = root_rot.clone()
+        start_ts = time.time()
+        for s in range(self.num_iters):
+            if isinstance(self.optim, torch.optim.LBFGS):
+                self.optim.step(partial(self.closure, joint_angles=joint_angles,
+                                                      root_pos=root_pos, 
+                                                      root_rot=root_rot,
+                                                      target_eef_pos=target_eef_pos,
+                                                      num_envs=num_envs))
+            else:
+                loss = self.closure(joint_angles, root_pos, root_rot, target_eef_pos, num_envs)
+            if verbose:
+                print(f"Step {s} Loss:",float(self.total_loss.mean()))
+            with torch.no_grad():
+                update_flag = self.total_loss < opt_value
+                if update_flag.sum() and s>20:
+                    opt_value[update_flag] = self.total_loss[update_flag].clone()
+                    opt_joint_angle[update_flag] = joint_angles[update_flag].clone()
+                    opt_root_pos[update_flag] = root_pos[update_flag].clone()
+                    opt_root_rot[update_flag] = root_rot[update_flag].clone()
+            if not isinstance(self.optim, torch.optim.LBFGS):
+                self.optim.step()
+        print("Optimization time:", time.time() - start_ts)
+        best_value_id = opt_value.argmin()
+        return opt_joint_angle[best_value_id], opt_root_pos[best_value_id], opt_root_rot[best_value_id]
+
+
 
 class SpringGraspOptimizer:
     def __init__(self, 

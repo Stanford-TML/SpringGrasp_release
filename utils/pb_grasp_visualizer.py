@@ -43,3 +43,40 @@ class GraspVisualizer:
         input("Press Enter to continue...")
         for vis in target_vis:
             pb.removeBody(vis)
+
+class HumanoidVisualizer:
+    def __init__(self, robot_urdf, env_pcd=None):
+        self._client = pb.connect(pb.GUI)
+        self.robot_id = pb.loadURDF(robot_urdf)
+        pb.setAdditionalSearchPath(pybullet_data.getDataPath())
+        self.floor_id = pb.loadURDF("plane.urdf", useFixedBase=True)
+        if env_pcd is not None:
+            self.env_pcd = env_pcd
+            pb.addUserDebugPoints(np.asarray(self.env_pcd.points),
+                                  np.asarray(self.env_pcd.colors),
+                                  pointSize=5)
+            
+    def visualize_robot(self, joint_angles, root_pose, target_pose):
+        """
+        joint_angles: [29] np.ndarray
+        root_pose: [6] np.ndarray
+        target_pose: [2, 3] np.ndarray
+        """
+        root_pos = root_pose[:3]
+        root_rot = Rotation.from_euler("XYZ", root_pose[3:]).as_quat()
+        target_vis = []
+        for i in range(len(target_pose)):
+            target_vis.append(rb.create_primitive_shape(pb, 0, pb.GEOM_SPHERE, [0.015], color=COLOR_CODE[i], collidable=False,init_xyz=target_pose[i]))
+
+        pb.resetBasePositionAndOrientation(self.robot_id, root_pos, root_rot)
+        
+        jid = 0
+        for i in range(pb.getNumJoints(self.robot_id)):    
+            if pb.getJointInfo(self.robot_id, i)[2] == pb.JOINT_REVOLUTE:
+                pb.resetJointState(self.robot_id, i, joint_angles[jid])
+                jid += 1
+        
+        input("Press Enter to continue...")
+        for vis in target_vis:
+            pb.removeBody(vis)
+    
