@@ -126,7 +126,7 @@ class HumanoidModel:
         
     @staticmethod
     def names_to_indices(names):
-        return [JOINT_NAMES.index(name) for name in names]
+        return [JOINT_NAMES.index(name)+1 for name in names]
     
 
     def from_mjcf(self, path):
@@ -261,7 +261,8 @@ class HumanoidModel:
         root_aa = euler_angles_to_axis_angle(root_rot, convention='XYZ')
         q = q[:,:, None] * G1_ROTATION_AXIS.to(q.device)
         pose_aa = torch.cat([root_aa[:, None], q], dim=1)
-        return self.fk_batch(pose_aa[:,None,:,:], root_pos[:, None,:])["global_translation"].squeeze(1)
+        result_dict = self.fk_batch(pose_aa[:,None,:,:], root_pos[:, None,:])
+        return result_dict["global_translation"].squeeze(1), result_dict["global_rotation_mat"].squeeze(1)
 
         
 
