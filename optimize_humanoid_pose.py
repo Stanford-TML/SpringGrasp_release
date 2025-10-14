@@ -26,7 +26,7 @@ if __name__ == "__main__":
     init_joint_angles[:,[3,9]] = 0.669
     init_joint_angles[:,[4,10]] = -0.363
 
-    humanoid_optimizer = HumanoidOptimizer(ref_q = np.zeros(29), num_iters=args.num_iters)
+    humanoid_optimizer = HumanoidOptimizer(ref_q = init_joint_angles.clone(), num_iters=args.num_iters)
     num_guesses = 30
     init_joint_angles = init_joint_angles.repeat_interleave(num_guesses,dim=0)
     init_joint_angles += torch.randn_like(init_joint_angles)*0.2

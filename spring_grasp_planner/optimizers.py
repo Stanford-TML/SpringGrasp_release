@@ -618,340 +618,6 @@ class FCGPISGraspOptimizer:
         opt_margin[~task_cost_flag] = -1.0 # Ensure that if task cost is not zero, margin is negative.
         return opt_tip_pose, opt_compliance, opt_target_pose, opt_palm_poses, opt_margin, opt_joint_angle
 
-class HumanoidOptimizer:
-    EEF_OFFSETS = torch.tensor([[0.12, 0.0, 0.065], [0.12, 0.0, 0.065]])
-    def __init__(self,
-                 eef_link_names=["left_wrist_yaw", "right_wrist_yaw"],
-                 foot_link_names = ["left_ankle_roll", "right_ankle_roll"],
-                 loss_weights = {"reg": 10.0, "foot": 100.0, "eef": 150.0, "root": 20.0, "foot_orn": 10.0, "stability": 10.0, "symmetry": 5.0},
-                 num_iters=200,
-                 ref_q=None,
-                 num_robot=1):
-        self.ref_q = torch.tensor(ref_q).to(device)
-        self.eef_ids = HumanoidModel.names_to_indices(eef_link_names)
-        self.foot_ids = HumanoidModel.names_to_indices(foot_link_names)
-        self.robot_model = HumanoidModel()
-        self.loss_weights = loss_weights
-        self.num_iters = num_iters
-        self.num_robot = num_robot
-
-    def forward_kinematics(self, joint_angles, root_pos, root_rot):
-        """
-        :params: joint_angles: [num_envs, num_dofs]
-        :params: root_pos: [num_envs, 3]
-        :params: root_ori: [num_envs, 3] euler angles
-        :return: tip_poses: [num_envs * num_fingers, 3]
-        """
-        if joint_angles.dim() == 1:
-            joint_angles = joint_angles.unsqueeze(0)
-            root_pos = root_pos.unsqueeze(0)
-            root_rot = root_rot.unsqueeze(0)
-        link_poses, link_rots = self.robot_model.compute_forward_kinematics(joint_angles, root_pos, root_rot)
-        eef_pos = link_poses[:,self.eef_ids,:] + (link_rots[:,self.eef_ids,:,:] @ HumanoidOptimizer.EEF_OFFSETS.view(1,len(self.eef_ids),3,1)).squeeze(-1)
-        foot_pos = link_poses[:,self.foot_ids,:]
-        foot_orn = link_rots[:,self.foot_ids,:,:]
-        return eef_pos, foot_pos, foot_orn
-
-    def reg_loss(self, joint_angles):
-        return ((joint_angles - self.ref_q)*REG_WEIGHT).norm(dim=1)
-    
-    def foot_ground_loss(self, foot_pos):
-        return foot_pos[:,:,2].abs().sum(dim=1)
-    
-    def root_orn_loss(self, root_orn):
-        # Prevent too much pitch/roll
-        return root_orn[:,:2].abs().sum(dim=1)
-
-    def foot_orn_loss(self, foot_orn):
-        # Prevent too much pitch/roll
-        return matrix_to_euler_angles(foot_orn, convention="XYZ")[...,:2].abs().sum(dim=(1,2))
-
-    def eef_loss(self, eef_pos, target_eef_pos):
-        return (eef_pos - target_eef_pos).norm(dim=2).sum(dim=1)
-
-    def symmetry_loss(self, joint_angles):
-        joint_angles_left = joint_angles[:, :6]
-        joint_angles_right = joint_angles[:, 6:12] * LEG_SIGN
-        return (joint_angles_left - joint_angles_right).norm(dim=1)
-    
-    def stability_loss(self, foot_pos, root_pos):
-        # Encourage the root to be above the foot center
-        foot_center = 0.5 * (foot_pos[:,0,:2] + foot_pos[:,1,:2])
-        return (foot_center - root_pos[:,:2]).norm(dim=1)
-
-    # assume all_tip_pose has same shape as target_pose
-    def compute_loss(self, joint_angles, foot_pos, eef_pos, target_eef_pos, root_orn, root_pos, foot_orn):
-        reg_cost = self.reg_loss(joint_angles) * self.loss_weights["reg"]
-        foot_cost = self.foot_ground_loss(foot_pos) *  self.loss_weights["foot"]
-        eef_cost = self.eef_loss(eef_pos, target_eef_pos) * self.loss_weights["eef"]
-        root_cost = self.root_orn_loss(root_orn) * self.loss_weights["root"]
-        foot_orn_loss = self.foot_orn_loss(foot_orn) * self.loss_weights["foot_orn"]
-        stability_loss = self.stability_loss(foot_pos, root_pos) * self.loss_weights["stability"]
-        symmetry_loss = self.symmetry_loss(joint_angles) * self.loss_weights["symmetry"]
-        total_cost = reg_cost + foot_cost + eef_cost + root_cost + foot_orn_loss + stability_loss + symmetry_loss
-        return total_cost
-
-    def closure(self, joint_angles, root_pos, root_rot, target_eef_pos, num_envs):
-        self.optim.zero_grad()
-        
-        self.eef_pos, self.foot_pos, foot_rot = self.forward_kinematics(joint_angles, root_pos, root_rot)
-    
-        
-        # Compute expected loss
-        total_loss = self.compute_loss(joint_angles, self.foot_pos, self.eef_pos, target_eef_pos, root_rot, root_pos, foot_rot)
-        self.total_loss = total_loss.float()
-        loss = total_loss.sum()
-        loss.backward()
-        return loss
-
-    def optimize(self, init_joint_angles, target_pose, verbose=True):
-        """
-        NOTE: scale matters in running optimization, need to normalize the scale
-        Params:
-        joint_angles: [num_envs, num_dofs]
-        target_pose: [num_envs, num_eefs, 3]
-        opt_mask: [num_envs, num_fingers]
-        """
-        joint_angles = init_joint_angles.clone().requires_grad_(True)
-        root_pos = torch.zeros(init_joint_angles.shape[0], 3).float().to(device)
-        root_pos[:,2] = 0.8
-        root_pos.requires_grad_(True)
-        root_rot = torch.zeros(init_joint_angles.shape[0], 3).float().to(device).requires_grad_(True)
-        target_eef_pos = target_pose.clone().to(device)
-        params_list = [{"params":joint_angles, "lr":1e-2},
-                       ]
-        params_list.append({"params":root_pos, "lr":1e-3})
-        params_list.append({"params":root_rot, "lr":1e-3})
-
-        self.optim = torch.optim.AdamW(params_list)
-
-        num_envs = init_joint_angles.shape[0]
-        opt_joint_angle = init_joint_angles.clone()
-        opt_value = torch.inf * torch.ones(num_envs).float().to(device)
-        opt_root_pos = root_pos.clone()
-        opt_root_rot = root_rot.clone()
-        start_ts = time.time()
-        for s in range(self.num_iters):
-            if isinstance(self.optim, torch.optim.LBFGS):
-                self.optim.step(partial(self.closure, joint_angles=joint_angles,
-                                                      root_pos=root_pos, 
-                                                      root_rot=root_rot,
-                                                      target_eef_pos=target_eef_pos,
-                                                      num_envs=num_envs))
-            else:
-                loss = self.closure(joint_angles, root_pos, root_rot, target_eef_pos, num_envs)
-            if verbose:
-                print(f"Step {s} Loss:",float(self.total_loss.mean()))
-            with torch.no_grad():
-                update_flag = self.total_loss < opt_value
-                if update_flag.sum() and s>20:
-                    opt_value[update_flag] = self.total_loss[update_flag].clone()
-                    opt_joint_angle[update_flag] = joint_angles[update_flag].clone()
-                    opt_root_pos[update_flag] = root_pos[update_flag].clone()
-                    opt_root_rot[update_flag] = root_rot[update_flag].clone()
-            if not isinstance(self.optim, torch.optim.LBFGS):
-                self.optim.step()
-        print("Optimization time:", time.time() - start_ts)
-        best_value_id = opt_value.argmin()
-        return opt_joint_angle[best_value_id], opt_root_pos[best_value_id], opt_root_rot[best_value_id]
-
-class SimpleSpringGraspOptimizer:
-    def __init__(self,
-                 num_iters=1000, optimize_target=False,
-                 pregrasp_coefficients = [[0.7,0.7,0.7,0.7]],
-                 pregrasp_weights = [1.0],
-                 mass = 0.1, com = [0.0, 0.0, 0.0], gravity=True,
-                 num_samples = 10,
-                 weight_config = None):
-        
-        self.num_iters = num_iters
-        
-        
-        self.optimize_target = optimize_target
-        
-        self.pregrasp_coefficients = torch.tensor(pregrasp_coefficients).to(device)
-        self.pregrasp_weights = torch.tensor(pregrasp_weights).double().to(device)
-        
-        
-        self.mass = mass
-        self.com = com
-        self.gravity = gravity
-        self.num_samples = num_samples
-        # Different weights, shoudl load from config.
-        if weight_config is None:
-            self.w_sp = 200.0
-            self.w_dist = 10000.0
-            self.w_uncer = 20.0
-            self.w_gain = 0.5
-            self.w_tar = 1000.0
-            self.w_col = 1.0
-            self.w_reg = 10.0
-            self.w_force = 200.0
-        else:
-            self.w_sp = weight_config["w_sp"]
-            self.w_dist = weight_config["w_dist"]
-            self.w_uncer = weight_config["w_uncer"]
-            self.w_gain = weight_config["w_gain"]
-            self.w_tar = weight_config["w_tar"]
-            self.w_col = weight_config["w_col"]
-            self.w_reg = weight_config["w_reg"]
-            self.w_force = weight_config["w_force"]
-        # Print out the weight configuration
-        print("========Weight Configuration:========")
-        print("w_sp:", self.w_sp)
-        print("w_dist:", self.w_dist)
-        print("w_uncer:", self.w_uncer)
-        print("w_gain:", self.w_gain)
-        print("w_tar:", self.w_tar)
-        print("w_col:", self.w_col)
-        print("w_reg:", self.w_reg)
-        print("w_force:", self.w_force)
-        print("=====================================")
-
-    
-    def compute_contact_margin(self, tip_pose, target_pose, current_normal, friction_mu):
-        force_dir = tip_pose - target_pose
-        force_dir = force_dir / force_dir.norm(dim=2, keepdim=True)
-        ang_diff = torch.einsum("ijk,ijk->ij",force_dir, current_normal)
-        cos_mu = torch.sqrt(1/(1+torch.tensor(friction_mu)**2))
-        margin = (ang_diff - cos_mu).clamp(-0.999)
-        reward = (0.2 * torch.log(ang_diff+1)+ 0.8*torch.log(margin+1)).sum(dim=1)
-        return reward
-
-    # assume all_tip_pose has same shape as target_pose
-    def compute_loss(self, all_tip_pose, target_pose, compliance, friction_mu, gpis):
-        # All tip pose should be [num_envs*1, 4, 3]
-        # Should use pregrasp tip_pose for sampling
-        dist, var = gpis.pred(all_tip_pose)
-        tar_dist, _ = gpis.pred(target_pose)
-        current_normal = gpis.compute_normal(all_tip_pose)
-        task_reward, margin, force_norm, R, t = force_eq_reward(
-                            all_tip_pose,
-                            target_pose,
-                            compliance,
-                            friction_mu, 
-                            current_normal.view(target_pose.shape),
-                            mass=self.mass,
-                            COM = self.com,
-                            gravity=10.0 if self.gravity else None)
-
-        # initial feasibility should be equally important as task reward.
-        c = -task_reward - self.compute_contact_margin(all_tip_pose, target_pose, current_normal, friction_mu=friction_mu)/2
-        offsets = torch.tensor([0.0, 0.0, 0.0]).to(device)
-        reg_cost = (torch.bmm(R,all_tip_pose.transpose(1,2)).transpose(1,2) + t.unsqueeze(1) - all_tip_pose - offsets).norm(dim=2).sum(dim=1) * 200.0
-        force_cost = -force_norm.clamp(max=2.0).mean(dim=1)
-        
-        contact_prob = 1.0/(torch.sqrt(var))*torch.exp(-dist**2/(2*var))
-        #variance_cost = self.uncertainty * torch.log(100 * var).max(dim=1)[0]
-        #print(float(variance_cost.max(dim=1)[0]))
-        dist_cost = torch.abs(dist).sum(dim=1)
-        tar_dist_cost = tar_dist.sum(dim=1) # 30
-        l = c * self.w_sp + dist_cost * self.w_dist + tar_dist_cost * self.w_tar + \
-            force_cost * self.w_force + reg_cost * self.w_reg + self.w_gain * compliance.sum(dim=1)
-        #print("All costs:", float(c.mean()), float(dist_cost.mean()), float(tar_dist_cost.mean()), float(center_cost.mean()), float(force_cost.mean()), float(ref_cost.mean()), float(variance_cost.mean()), float(reg_cost.mean()))
-        return l, margin, R, t, contact_prob
-
-    def closure(self, init_tip_pose, compliance, target_pose, friction_mu, gpis, num_envs):
-        self.optim.zero_grad()
-    
-        # Compute expected loss
-        target_pose_extended = target_pose.repeat(len(self.pregrasp_coefficients),1,1)
-        pregrasp_tip_pose_extended = init_tip_pose.repeat(len(self.pregrasp_coefficients),1,1) #[e1,e2,e3,e4,e1,e2,e3,e4, ...]
-        pregrasp_coeffs = self.pregrasp_coefficients.repeat_interleave(num_envs,dim=0)
-        all_tip_pose = target_pose_extended + pregrasp_coeffs.view(-1, 4, 1) * (pregrasp_tip_pose_extended - target_pose_extended)
-        l, margin, R, t, contact_prob = self.compute_loss(all_tip_pose, # [num_envs*num_coeffs, 4, 3]
-                                      target_pose_extended, 
-                                      compliance.repeat(len(self.pregrasp_coefficients), 1), friction_mu, gpis)
-
-        interp = torch.linspace(0, 1, self.num_samples).to(device).view(1, self.num_samples, 1, 1)
-        delta_vector = (init_tip_pose - target_pose).unsqueeze(1).repeat(1, self.num_samples, 1, 1) * interp
-        sample_points = target_pose.unsqueeze(1).repeat(1, self.num_samples, 1, 1) + delta_vector
-        sample_dist, sample_var = gpis.pred(sample_points.view(-1,4,3))
-        sample_prob = (1/torch.sqrt(sample_var))*torch.exp(-sample_dist**2 / (2 * sample_var)) #[num_envs * num_samples, 4, 1]
-        sample_prob = sample_prob.view(-1, self.num_samples, 4, 1)
-        # Normalize sample probability
-        normalization_factor = sample_prob.sum(dim=1) # [num_envs, 4, 1]
-        sample_prob = sample_prob / normalization_factor.unsqueeze(1) 
-        
-        contact_prob = (contact_prob.unsqueeze(2) / normalization_factor).unsqueeze(1) # [num_envs, 1, 4, 1]
-        total_prominence = (contact_prob - sample_prob).sum(dim=1).squeeze(-1) # [num_envs, 4]
-        prominence_loss = total_prominence.sum(dim=1) # NOTE: Variance loss
-        total_loss = -prominence_loss * self.w_uncer # NOTE: Variance loss
-        self.R, self.t = R, t
-        task_loss = l
-        total_loss += task_loss
-        self.total_margin = (self.pregrasp_weights.view(-1,1,1) * margin.view(-1, num_envs, 4)).sum(dim=0)
-        pre_dist, _ = gpis.pred(init_tip_pose)
-        pre_dist_loss = -pre_dist.sum(dim=1) * 50.0 # NOTE: Experimental
-        total_loss += pre_dist_loss # Ignored for now
-        
-        self.total_loss = total_loss
-        loss = total_loss.sum() # TODO: TO BE FINISHED
-        loss.backward()
-        return loss
-
-    def optimize(self, init_tip_pose, target_pose, compliance, friction_mu, gpis, verbose=True):
-        """
-        NOTE: scale matters in running optimization, need to normalize the scale
-        Params:
-        joint_angles: [num_envs, num_dofs]
-        target_pose: [num_envs, num_fingers, 3]
-        compliance: [num_envs, num_fingers]
-        opt_mask: [num_envs, num_fingers]
-        """
-        init_tip_pose = init_tip_pose.clone().requires_grad_(True)
-        compliance = compliance.clone().requires_grad_(True)
-        params_list = [{"params":init_tip_pose, "lr":2e-3},
-                       {"params":compliance, "lr":0.5}]
-        if self.optimize_target:
-            target_pose = target_pose.clone().requires_grad_(True)
-            params_list.append({"params":target_pose, "lr":2e-3})
-        
-        
-
-        self.optim = torch.optim.AdamW(params_list)
-
-        num_envs = init_tip_pose.shape[0]
-        opt_tip_pose = init_tip_pose.clone()
-        opt_compliance = compliance.clone()
-        opt_target_pose = target_pose.clone()
-        opt_value = torch.inf * torch.ones(num_envs).double().to(device)
-        opt_margin = torch.zeros(num_envs, 4).double().to(device)
-        opt_R, opt_t = torch.zeros(num_envs, 3, 3).double().to(device), torch.zeros(num_envs, 3).double().to(device)
-        start_ts = time.time()
-        for s in range(self.num_iters):
-            if isinstance(self.optim, torch.optim.LBFGS):
-                self.optim.step(partial(self.closure, init_tip_pose=init_tip_pose,
-                                                      compliance=compliance, 
-                                                      target_pose=target_pose, 
-                                                      friction_mu=friction_mu, 
-                                                      gpis=gpis, num_envs=num_envs))
-            else:
-                loss = self.closure(init_tip_pose, compliance, target_pose, friction_mu, gpis, num_envs)
-            if verbose:
-                print(f"Step {s} Loss:",float(self.total_loss.mean()))
-            if torch.isnan(self.total_loss.sum()):
-                print("NaN detected:", self.pregrasp_tip_pose, self.total_margin)
-            with torch.no_grad():
-                update_flag = self.total_loss < opt_value
-                if update_flag.sum() and s>20:
-                    opt_value[update_flag] = self.total_loss[update_flag].clone()
-                    opt_margin[update_flag] = self.total_margin[update_flag].clone()
-                    opt_tip_pose[update_flag] = init_tip_pose[update_flag].clone()
-                    opt_target_pose[update_flag] = target_pose[update_flag].clone()
-                    opt_compliance[update_flag] = compliance[update_flag].clone()
-                    opt_R[update_flag] = self.R[update_flag].clone()
-                    opt_t[update_flag] = self.t[update_flag].clone()
-            if not isinstance(self.optim, torch.optim.LBFGS):
-                self.optim.step()
-            with torch.no_grad():
-                compliance.clamp_(min=40.0) # prevent negative compliance
-        print("Optimization time:", time.time() - start_ts)
-        print("Margin:",opt_margin)
-        return opt_tip_pose, opt_compliance, opt_target_pose, opt_margin, opt_R, opt_t
-
-
-
 class SpringGraspOptimizer:
     def __init__(self, 
                  robot_urdf, 
@@ -1241,4 +907,639 @@ class SpringGraspOptimizer:
         print("Optimization time:", time.time() - start_ts)
         print("Margin:",opt_margin)
         return opt_joint_angle, opt_compliance, opt_target_pose, opt_palm_poses, opt_margin, opt_R, opt_t
+
+class HumanoidOptimizer:
+    EEF_OFFSETS = torch.tensor([[0.12, 0.0, 0.065], [0.12, 0.0, 0.065]])
+    def __init__(self,
+                 eef_link_names=["left_wrist_yaw", "right_wrist_yaw"],
+                 foot_link_names = ["left_ankle_roll", "right_ankle_roll"],
+                 loss_weights = {"reg": 10.0, "foot": 100.0, "eef": 150.0, "root": 20.0, "foot_orn": 10.0, "stability": 10.0, "symmetry": 5.0},
+                 num_iters=200,
+                 ref_q=None,
+                 num_robot=1):
+        self.ref_q = torch.tensor(ref_q).to(device)
+        self.eef_ids = HumanoidModel.names_to_indices(eef_link_names)
+        self.foot_ids = HumanoidModel.names_to_indices(foot_link_names)
+        self.robot_model = HumanoidModel()
+        self.loss_weights = loss_weights
+        self.num_iters = num_iters
+        self.num_robot = num_robot
+
+    def forward_kinematics(self, joint_angles, root_pos, root_rot):
+        """
+        :params: joint_angles: [num_envs, num_dofs]
+        :params: root_pos: [num_envs, 3]
+        :params: root_ori: [num_envs, 3] euler angles
+        :return: tip_poses: [num_envs * num_fingers, 3]
+        """
+        if joint_angles.dim() == 1:
+            joint_angles = joint_angles.unsqueeze(0)
+            root_pos = root_pos.unsqueeze(0)
+            root_rot = root_rot.unsqueeze(0)
+        link_poses, link_rots = self.robot_model.compute_forward_kinematics(joint_angles, root_pos, root_rot)
+        eef_pos = link_poses[:,self.eef_ids,:] + (link_rots[:,self.eef_ids,:,:] @ HumanoidOptimizer.EEF_OFFSETS.view(1,len(self.eef_ids),3,1)).squeeze(-1)
+        foot_pos = link_poses[:,self.foot_ids,:]
+        foot_orn = link_rots[:,self.foot_ids,:,:]
+        return eef_pos, foot_pos, foot_orn
+
+    def reg_loss(self, joint_angles):
+        return ((joint_angles - self.ref_q)*REG_WEIGHT).norm(dim=1)
+    
+    def foot_ground_loss(self, foot_pos):
+        return foot_pos[:,:,2].abs().sum(dim=1)
+    
+    def root_orn_loss(self, root_orn):
+        # Prevent too much pitch/roll
+        return root_orn[:,:2].abs().sum(dim=1)
+
+    def foot_orn_loss(self, foot_orn):
+        # Prevent too much pitch/roll
+        return matrix_to_euler_angles(foot_orn, convention="XYZ")[...,:2].abs().sum(dim=(1,2))
+
+    def eef_loss(self, eef_pos, target_eef_pos):
+        return (eef_pos - target_eef_pos).norm(dim=2).sum(dim=1)
+
+    def symmetry_loss(self, joint_angles):
+        joint_angles_left = joint_angles[:, :6]
+        joint_angles_right = joint_angles[:, 6:12] * LEG_SIGN
+        return (joint_angles_left - joint_angles_right).norm(dim=1)
+    
+    def stability_loss(self, foot_pos, root_pos):
+        # Encourage the root to be above the foot center
+        foot_center = 0.5 * (foot_pos[:,0,:2] + foot_pos[:,1,:2])
+        return (foot_center - root_pos[:,:2]).norm(dim=1)
+
+    # assume all_tip_pose has same shape as target_pose
+    def compute_loss(self, joint_angles, foot_pos, eef_pos, target_eef_pos, root_orn, root_pos, foot_orn):
+        reg_cost = self.reg_loss(joint_angles) * self.loss_weights["reg"]
+        foot_cost = self.foot_ground_loss(foot_pos) *  self.loss_weights["foot"]
+        eef_cost = self.eef_loss(eef_pos, target_eef_pos) * self.loss_weights["eef"]
+        root_cost = self.root_orn_loss(root_orn) * self.loss_weights["root"]
+        foot_orn_loss = self.foot_orn_loss(foot_orn) * self.loss_weights["foot_orn"]
+        stability_loss = self.stability_loss(foot_pos, root_pos) * self.loss_weights["stability"]
+        symmetry_loss = self.symmetry_loss(joint_angles) * self.loss_weights["symmetry"]
+        total_cost = reg_cost + foot_cost + eef_cost + root_cost + foot_orn_loss + stability_loss + symmetry_loss
+        return total_cost
+
+    def closure(self, joint_angles, root_pos, root_rot, target_eef_pos, num_envs):
+        self.optim.zero_grad()
+        
+        self.eef_pos, self.foot_pos, foot_rot = self.forward_kinematics(joint_angles, root_pos, root_rot)
+    
+        
+        # Compute expected loss
+        total_loss = self.compute_loss(joint_angles, self.foot_pos, self.eef_pos, target_eef_pos, root_rot, root_pos, foot_rot)
+        self.total_loss = total_loss.float()
+        loss = total_loss.sum()
+        loss.backward()
+        return loss
+
+    def optimize(self, init_joint_angles, target_pose, verbose=True):
+        """
+        NOTE: scale matters in running optimization, need to normalize the scale
+        Params:
+        joint_angles: [num_envs, num_dofs]
+        target_pose: [num_envs, num_eefs, 3]
+        opt_mask: [num_envs, num_fingers]
+        """
+        joint_angles = init_joint_angles.clone().requires_grad_(True)
+        root_pos = torch.zeros(init_joint_angles.shape[0], 3).float().to(device)
+        root_pos[:,2] = 0.8
+        root_pos.requires_grad_(True)
+        root_rot = torch.zeros(init_joint_angles.shape[0], 3).float().to(device).requires_grad_(True)
+        target_eef_pos = target_pose.clone().to(device)
+        params_list = [{"params":joint_angles, "lr":1e-2},
+                       ]
+        params_list.append({"params":root_pos, "lr":1e-3})
+        params_list.append({"params":root_rot, "lr":1e-3})
+
+        self.optim = torch.optim.AdamW(params_list)
+
+        num_envs = init_joint_angles.shape[0]
+        opt_joint_angle = init_joint_angles.clone()
+        opt_value = torch.inf * torch.ones(num_envs).float().to(device)
+        opt_root_pos = root_pos.clone()
+        opt_root_rot = root_rot.clone()
+        start_ts = time.time()
+        for s in range(self.num_iters):
+            if isinstance(self.optim, torch.optim.LBFGS):
+                self.optim.step(partial(self.closure, joint_angles=joint_angles,
+                                                      root_pos=root_pos, 
+                                                      root_rot=root_rot,
+                                                      target_eef_pos=target_eef_pos,
+                                                      num_envs=num_envs))
+            else:
+                loss = self.closure(joint_angles, root_pos, root_rot, target_eef_pos, num_envs)
+            if verbose:
+                print(f"Step {s} Loss:",float(self.total_loss.mean()))
+            with torch.no_grad():
+                update_flag = self.total_loss < opt_value
+                if update_flag.sum() and s>20:
+                    opt_value[update_flag] = self.total_loss[update_flag].clone()
+                    opt_joint_angle[update_flag] = joint_angles[update_flag].clone()
+                    opt_root_pos[update_flag] = root_pos[update_flag].clone()
+                    opt_root_rot[update_flag] = root_rot[update_flag].clone()
+            if not isinstance(self.optim, torch.optim.LBFGS):
+                self.optim.step()
+        print("Optimization time:", time.time() - start_ts)
+        best_value_id = opt_value.argmin()
+        return opt_joint_angle[best_value_id], opt_root_pos[best_value_id], opt_root_rot[best_value_id]
+
+class SimpleSpringGraspOptimizer:
+    def __init__(self,
+                 num_iters=1000, optimize_target=True,
+                 pregrasp_coefficients = [[0.7,0.7,0.7,0.7]],
+                 pregrasp_weights = [1.0],
+                 mass = 0.1, com = [0.0, 0.0, 0.0], gravity=True,
+                 num_samples = 10,
+                 weight_config = None):
+        
+        self.num_iters = num_iters
+        
+        self.optimize_target = optimize_target
+        self.pregrasp_coefficients = torch.tensor(pregrasp_coefficients).to(device)
+        self.pregrasp_weights = torch.tensor(pregrasp_weights).double().to(device)
+        self.mass = mass
+        self.com = com
+        self.gravity = gravity
+        self.num_samples = num_samples
+        # Different weights, shoudl load from config.
+        if weight_config is None:
+            self.w_sp = 200.0
+            self.w_dist = 10000.0
+            self.w_uncer = 20.0
+            self.w_gain = 0.5
+            self.w_tar = 1000.0
+            self.w_reg = 10.0
+            self.w_force = 200.0
+        else:
+            self.w_sp = weight_config["w_sp"]
+            self.w_dist = weight_config["w_dist"]
+            self.w_uncer = weight_config["w_uncer"]
+            self.w_gain = weight_config["w_gain"]
+            self.w_tar = weight_config["w_tar"]
+            self.w_reg = weight_config["w_reg"]
+            self.w_force = weight_config["w_force"]
+        # Print out the weight configuration
+        print("========Weight Configuration:========")
+        print("w_sp:", self.w_sp)
+        print("w_dist:", self.w_dist)
+        print("w_uncer:", self.w_uncer)
+        print("w_gain:", self.w_gain)
+        print("w_tar:", self.w_tar)
+        print("w_reg:", self.w_reg)
+        print("w_force:", self.w_force)
+        print("=====================================")
+
+    
+    def compute_contact_margin(self, tip_pose, target_pose, current_normal, friction_mu):
+        force_dir = tip_pose - target_pose
+        force_dir = force_dir / force_dir.norm(dim=2, keepdim=True)
+        ang_diff = torch.einsum("ijk,ijk->ij",force_dir, current_normal)
+        cos_mu = torch.sqrt(1/(1+torch.tensor(friction_mu)**2))
+        margin = (ang_diff - cos_mu).clamp(-0.999)
+        reward = (0.2 * torch.log(ang_diff+1)+ 0.8*torch.log(margin+1)).sum(dim=1)
+        return reward
+
+    # assume all_tip_pose has same shape as target_pose
+    def compute_loss(self, all_tip_pose, target_pose, compliance, friction_mu, gpis):
+        # All tip pose should be [num_envs*1, 4, 3]
+        # Should use pregrasp tip_pose for sampling
+        dist, var = gpis.pred(all_tip_pose)
+        tar_dist, _ = gpis.pred(target_pose)
+        current_normal = gpis.compute_normal(all_tip_pose)
+        task_reward, margin, force_norm, R, t = force_eq_reward(
+                            all_tip_pose,
+                            target_pose,
+                            compliance,
+                            friction_mu, 
+                            current_normal.view(target_pose.shape),
+                            mass=self.mass,
+                            COM = self.com,
+                            gravity=10.0 if self.gravity else None)
+
+        # initial feasibility should be equally important as task reward.
+        c = -task_reward - self.compute_contact_margin(all_tip_pose, target_pose, current_normal, friction_mu=friction_mu)/2
+        offsets = torch.tensor([0.0, 0.0, 0.0]).to(device)
+        reg_cost = (torch.bmm(R,all_tip_pose.transpose(1,2)).transpose(1,2) + t.unsqueeze(1) - all_tip_pose - offsets).norm(dim=2).sum(dim=1) * 200.0
+        force_cost = -force_norm.clamp(max=2.0).mean(dim=1)
+        
+        contact_prob = 1.0/(torch.sqrt(var))*torch.exp(-dist**2/(2*var))
+        #variance_cost = self.uncertainty * torch.log(100 * var).max(dim=1)[0]
+        #print(float(variance_cost.max(dim=1)[0]))
+        dist_cost = torch.abs(dist).sum(dim=1)
+        tar_dist_cost = tar_dist.sum(dim=1) # 30
+        l = c * self.w_sp + dist_cost * self.w_dist + tar_dist_cost * self.w_tar + \
+            force_cost * self.w_force + reg_cost * self.w_reg + self.w_gain * compliance.sum(dim=1)
+        #print("All costs:", float(c.mean()), float(dist_cost.mean()), float(tar_dist_cost.mean()), float(center_cost.mean()), float(force_cost.mean()), float(ref_cost.mean()), float(variance_cost.mean()), float(reg_cost.mean()))
+        return l, margin, R, t, contact_prob
+
+    def closure(self, init_tip_pose, compliance, target_pose, friction_mu, gpis, num_envs):
+        self.optim.zero_grad()
+    
+        # Compute expected loss
+        target_pose_extended = target_pose.repeat(len(self.pregrasp_coefficients),1,1)
+        pregrasp_tip_pose_extended = init_tip_pose.repeat(len(self.pregrasp_coefficients),1,1) #[e1,e2,e3,e4,e1,e2,e3,e4, ...]
+        pregrasp_coeffs = self.pregrasp_coefficients.repeat_interleave(num_envs,dim=0)
+        all_tip_pose = target_pose_extended + pregrasp_coeffs.view(-1, 4, 1) * (pregrasp_tip_pose_extended - target_pose_extended)
+        l, margin, R, t, contact_prob = self.compute_loss(all_tip_pose, # [num_envs*num_coeffs, 4, 3]
+                                      target_pose_extended, 
+                                      compliance.repeat(len(self.pregrasp_coefficients), 1), friction_mu, gpis)
+
+        interp = torch.linspace(0, 1, self.num_samples).to(device).view(1, self.num_samples, 1, 1)
+        delta_vector = (init_tip_pose - target_pose).unsqueeze(1).repeat(1, self.num_samples, 1, 1) * interp
+        sample_points = target_pose.unsqueeze(1).repeat(1, self.num_samples, 1, 1) + delta_vector
+        sample_dist, sample_var = gpis.pred(sample_points.view(-1,4,3))
+        sample_prob = (1/torch.sqrt(sample_var))*torch.exp(-sample_dist**2 / (2 * sample_var)) #[num_envs * num_samples, 4, 1]
+        sample_prob = sample_prob.view(-1, self.num_samples, 4, 1)
+        # Normalize sample probability
+        normalization_factor = sample_prob.sum(dim=1) # [num_envs, 4, 1]
+        sample_prob = sample_prob / normalization_factor.unsqueeze(1) 
+        
+        contact_prob = (contact_prob.unsqueeze(2) / normalization_factor).unsqueeze(1) # [num_envs, 1, 4, 1]
+        total_prominence = (contact_prob - sample_prob).sum(dim=1).squeeze(-1) # [num_envs, 4]
+        prominence_loss = total_prominence.sum(dim=1) # NOTE: Variance loss
+        total_loss = -prominence_loss * self.w_uncer # NOTE: Variance loss
+        self.R, self.t = R, t
+        task_loss = l
+        total_loss += task_loss
+        self.total_margin = (self.pregrasp_weights.view(-1,1,1) * margin.view(-1, num_envs, 4)).sum(dim=0)
+        pre_dist, _ = gpis.pred(init_tip_pose)
+        pre_dist_loss = -pre_dist.sum(dim=1) * 50.0 # NOTE: Experimental
+        total_loss += pre_dist_loss # Ignored for now
+        
+        self.total_loss = total_loss
+        loss = total_loss.sum() # TODO: TO BE FINISHED
+        loss.backward()
+        return loss
+
+    def optimize(self, init_tip_pose, target_pose, compliance, friction_mu, gpis, verbose=True):
+        """
+        NOTE: scale matters in running optimization, need to normalize the scale
+        Params:
+        joint_angles: [num_envs, num_dofs]
+        target_pose: [num_envs, num_fingers, 3]
+        compliance: [num_envs, num_fingers]
+        opt_mask: [num_envs, num_fingers]
+        """
+        init_tip_pose = init_tip_pose.clone().requires_grad_(True)
+        compliance = compliance.clone().requires_grad_(True)
+        params_list = [{"params":init_tip_pose, "lr":2e-3},
+                       {"params":compliance, "lr":0.5}]
+        if self.optimize_target:
+            target_pose = target_pose.clone().requires_grad_(True)
+            params_list.append({"params":target_pose, "lr":2e-3})
+        
+        
+
+        self.optim = torch.optim.AdamW(params_list)
+
+        num_envs = init_tip_pose.shape[0]
+        opt_tip_pose = init_tip_pose.clone()
+        opt_compliance = compliance.clone()
+        opt_target_pose = target_pose.clone()
+        opt_value = torch.inf * torch.ones(num_envs).double().to(device)
+        opt_margin = torch.zeros(num_envs, 4).double().to(device)
+        opt_R, opt_t = torch.zeros(num_envs, 3, 3).double().to(device), torch.zeros(num_envs, 3).double().to(device)
+        start_ts = time.time()
+        for s in range(self.num_iters):
+            if isinstance(self.optim, torch.optim.LBFGS):
+                self.optim.step(partial(self.closure, init_tip_pose=init_tip_pose,
+                                                      compliance=compliance, 
+                                                      target_pose=target_pose, 
+                                                      friction_mu=friction_mu, 
+                                                      gpis=gpis, num_envs=num_envs))
+            else:
+                loss = self.closure(init_tip_pose, compliance, target_pose, friction_mu, gpis, num_envs)
+            if verbose:
+                print(f"Step {s} Loss:",float(self.total_loss.mean()))
+            if torch.isnan(self.total_loss.sum()):
+                print("NaN detected:", self.pregrasp_tip_pose, self.total_margin)
+            with torch.no_grad():
+                update_flag = self.total_loss < opt_value
+                if update_flag.sum() and s>20:
+                    opt_value[update_flag] = self.total_loss[update_flag].clone()
+                    opt_margin[update_flag] = self.total_margin[update_flag].clone()
+                    opt_tip_pose[update_flag] = init_tip_pose[update_flag].clone()
+                    opt_target_pose[update_flag] = target_pose[update_flag].clone()
+                    opt_compliance[update_flag] = compliance[update_flag].clone()
+                    opt_R[update_flag] = self.R[update_flag].clone()
+                    opt_t[update_flag] = self.t[update_flag].clone()
+            if not isinstance(self.optim, torch.optim.LBFGS):
+                self.optim.step()
+            with torch.no_grad():
+                compliance.clamp_(min=40.0) # prevent negative compliance
+        print("Optimization time:", time.time() - start_ts)
+        print("Margin:",opt_margin)
+        return opt_tip_pose, opt_compliance, opt_target_pose, opt_margin, opt_R, opt_t
+
+class HumanoidSpringGraspOptimizer:
+    EEF_OFFSETS = torch.tensor([[0.12, 0.0, 0.065], [0.12, 0.0, 0.065]])
+    def __init__(self,
+                 eef_link_names=["left_wrist_yaw", "right_wrist_yaw"],
+                 foot_link_names = ["left_ankle_roll", "right_ankle_roll"],
+                 loss_weights = {"reg": 10.0, "foot": 100.0, "eef": 150.0, "root": 20.0, "foot_orn": 10.0, "stability": 10.0, "symmetry": 5.0},
+                 num_iters=200,
+                 ref_q=None,
+                 num_robots=2,
+                 pregrasp_coefficients = [[0.7,0.7,0.7,0.7]],
+                 pregrasp_weights = [1.0],
+                 mass = 0.1, com = [0.0, 0.0, 0.0], scale=1.0, gravity=True, # com is post scaled
+                 num_samples = 10,
+                 weight_config = None):
+        # Common
+        self.num_iters = num_iters
+
+        # Robot related
+        self.ref_q = torch.tensor(ref_q).to(device)
+        self.eef_ids = HumanoidModel.names_to_indices(eef_link_names)
+        self.foot_ids = HumanoidModel.names_to_indices(foot_link_names)
+        self.robot_model = HumanoidModel()
+        self.loss_weights = loss_weights
+        self.num_robots = num_robots
+
+        # Spring Grasp related
+        self.pregrasp_coefficients = torch.tensor(pregrasp_coefficients).to(device)
+        self.pregrasp_weights = torch.tensor(pregrasp_weights).double().to(device)
+        self.mass = mass
+        self.com = torch.tensor(com).to(device)
+        self.real_com = torch.tensor(com).to(device) / scale
+        self.scale = scale
+        self.gravity = gravity
+        self.num_samples = num_samples
+        # Different weights, shoudl load from config.
+        # Different weights, shoudl load from config.
+        if weight_config is None:
+            self.w_sp = 200.0
+            self.w_dist = 10000.0
+            self.w_uncer = 20.0
+            self.w_gain = 0.5
+            self.w_tar = 1000.0
+            self.w_reg = 10.0
+            self.w_force = 200.0
+        else:
+            self.w_sp = weight_config["w_sp"]
+            self.w_dist = weight_config["w_dist"]
+            self.w_uncer = weight_config["w_uncer"]
+            self.w_gain = weight_config["w_gain"]
+            self.w_tar = weight_config["w_tar"]
+            self.w_reg = weight_config["w_reg"]
+            self.w_force = weight_config["w_force"]
+        # Print out the weight configuration
+        print("========Weight Configuration:========")
+        print("w_sp:", self.w_sp)
+        print("w_dist:", self.w_dist)
+        print("w_uncer:", self.w_uncer)
+        print("w_gain:", self.w_gain)
+        print("w_tar:", self.w_tar)
+        print("w_reg:", self.w_reg)
+        print("w_force:", self.w_force)
+        print("=====================================")
+
+    def forward_kinematics(self, joint_angles, root_pos, root_rot):
+        """
+        :params: joint_angles: [num_envs, num_robots, num_dofs]
+        :params: root_pos: [num_envs, num_robots, 3]
+        :params: root_ori: [num_envs, num_robots, 3] euler angles
+        """
+        if joint_angles.dim() == 3:
+            joint_angles_ = joint_angles.view(-1, joint_angles.shape[-1])
+            root_pos_ = root_pos.view(-1, root_pos.shape[-1])
+            root_rot_ = root_rot.view(-1, root_rot.shape[-1])
+        else:
+            joint_angles_ = joint_angles
+            root_pos_ = root_pos
+            root_rot_ = root_rot
+
+        link_poses, link_rots = self.robot_model.compute_forward_kinematics(joint_angles_, root_pos_, root_rot_)
+        eef_pos = link_poses[:,self.eef_ids,:] + (link_rots[:,self.eef_ids,:,:] @ HumanoidOptimizer.EEF_OFFSETS.view(1,len(self.eef_ids),3,1)).squeeze(-1)
+        foot_pos = link_poses[:,self.foot_ids,:]
+        foot_orn = link_rots[:,self.foot_ids,:,:]
+        if joint_angles.dim() == 3:
+            eef_pos = eef_pos.view(joint_angles.shape[0],self.num_robots, len(self.eef_ids), 3)
+            foot_pos = foot_pos.view(joint_angles.shape[0],self.num_robots, len(self.foot_ids), 3)
+            foot_orn = foot_orn.view(joint_angles.shape[0],self.num_robots, len(self.foot_ids), 3, 3)
+        return eef_pos, foot_pos, foot_orn
+
+    def compute_contact_margin(self, tip_pose, target_pose, current_normal, friction_mu):
+        force_dir = tip_pose - target_pose
+        force_dir = force_dir / force_dir.norm(dim=2, keepdim=True)
+        ang_diff = torch.einsum("ijk,ijk->ij",force_dir, current_normal)
+        cos_mu = torch.sqrt(1/(1+torch.tensor(friction_mu)**2))
+        margin = (ang_diff - cos_mu).clamp(-0.999)
+        reward = (0.2 * torch.log(ang_diff+1)+ 0.8*torch.log(margin+1)).sum(dim=1)
+        return reward
+    
+    
+    def reg_loss(self, joint_angles):
+        """
+        :joint_angles: [num_envs, num_robots, num_dofs]
+        """
+        return ((joint_angles - self.ref_q)*REG_WEIGHT).norm(dim=-1).sum(dim=1)
+    
+    def foot_ground_loss(self, foot_pos):
+        """
+        :foot_pos: [num_envs, num_robots, num_feet, 3]
+        """
+        return foot_pos[...,2].abs().sum(dim=(1,2))
+    
+    def root_orn_loss(self, root_orn):
+        """
+        :root_orn: [num_envs, num_robots, 3]
+        """
+        # Prevent too much pitch/roll
+        return root_orn[...,:2].abs().sum(dim=(1,2))
+
+    def foot_orn_loss(self, foot_orn):
+        """
+        :foot_orn: [num_envs, num_robots, num_feet, 3, 3]
+        """
+        # Prevent too much pitch/roll
+        return matrix_to_euler_angles(foot_orn, convention="XYZ")[...,:2].abs().sum(dim=(1,2,3))
+
+    def symmetry_loss(self, joint_angles):
+        """
+        :joint_angles: [num_envs, num_robots, num_dofs]
+        """
+        joint_angles_left = joint_angles[..., :6]
+        joint_angles_right = joint_angles[..., 6:12] * LEG_SIGN
+        return (joint_angles_left - joint_angles_right).norm(dim=2).sum(dim=1)
+    
+    def stability_loss(self, foot_pos, root_pos):
+        """
+        :foot_pos: [num_envs, num_robots, num_feet, 3]
+        :root_pos: [num_envs, num_robots, 3]
+        """
+        # Encourage the root to be above the foot center
+        foot_center = 0.5 * (foot_pos[:,:,0,:2] + foot_pos[:,:,1,:2])
+        return (foot_center - root_pos[...,:2]).norm(dim=2).sum(dim=1)
+
+    def spring_grasp_loss(self, all_tip_pose, target_pose, compliance, friction_mu, gpis):
+        # All tip pose should be [num_envs*1, 4, 3]
+        # Should use pregrasp tip_pose for sampling
+        dist, var = gpis.pred(all_tip_pose)
+        tar_dist, _ = gpis.pred(target_pose)
+        current_normal = gpis.compute_normal(all_tip_pose)
+        task_reward, margin, force_norm, R, t = force_eq_reward(
+                            all_tip_pose,
+                            target_pose,
+                            compliance,
+                            friction_mu, 
+                            current_normal.view(target_pose.shape),
+                            mass=self.mass,
+                            COM = self.com,
+                            gravity=10.0 if self.gravity else None)
+
+        # initial feasibility should be equally important as task reward.
+        c = -task_reward - self.compute_contact_margin(all_tip_pose, target_pose, current_normal, friction_mu=friction_mu)/2
+        offsets = torch.tensor([0.0, 0.0, 0.0]).to(device)
+        reg_cost = (torch.bmm(R,all_tip_pose.transpose(1,2)).transpose(1,2) + t.unsqueeze(1) - all_tip_pose - offsets).norm(dim=2).sum(dim=1) * 200.0
+        force_cost = -force_norm.clamp(max=2.0).mean(dim=1)
+        
+        contact_prob = 1.0/(torch.sqrt(var))*torch.exp(-dist**2/(2*var))
+        #variance_cost = self.uncertainty * torch.log(100 * var).max(dim=1)[0]
+        #print(float(variance_cost.max(dim=1)[0]))
+        dist_cost = torch.abs(dist).sum(dim=1)
+        tar_dist_cost = tar_dist.sum(dim=1) # 30
+        l = c * self.w_sp + dist_cost * self.w_dist + tar_dist_cost * self.w_tar + \
+            force_cost * self.w_force + reg_cost * self.w_reg + self.w_gain * compliance.sum(dim=1)
+        #print("All costs:", float(c.mean()), float(dist_cost.mean()), float(tar_dist_cost.mean()), float(center_cost.mean()), float(force_cost.mean()), float(ref_cost.mean()), float(variance_cost.mean()), float(reg_cost.mean()))
+        return l, margin, R, t, contact_prob
+    
+
+    def kinematic_loss(self, joint_angles, foot_pos, root_orn, root_pos, foot_orn):
+        """
+        :joint_angles: [num_envs, num_robots, num_dofs]
+        :foot_pos: [num_envs, num_robots, num_feet, 3]
+        :root_orn: [num_envs, num_robots, 3]
+        :root_pos: [num_envs, num_robots, 3]
+        :foot_orn: [num_envs, num_robots, num_feet, 3, 3]
+        """
+        reg_cost = self.reg_loss(joint_angles) * self.loss_weights["reg"]
+        foot_cost = self.foot_ground_loss(foot_pos) *  self.loss_weights["foot"]
+        root_cost = self.root_orn_loss(root_orn) * self.loss_weights["root"]
+        foot_orn_loss = self.foot_orn_loss(foot_orn) * self.loss_weights["foot_orn"]
+        stability_loss = self.stability_loss(foot_pos, root_pos) * self.loss_weights["stability"]
+        symmetry_loss = self.symmetry_loss(joint_angles) * self.loss_weights["symmetry"]
+        total_cost = reg_cost + foot_cost  + root_cost + foot_orn_loss + stability_loss + symmetry_loss
+        return total_cost
+    
+    def closure(self, joint_angles, root_pos, root_rot, compliance, target_pose, friction_mu, gpis, num_envs):
+        """
+         :joint_angles: [num_envs, num_robots, num_dofs]
+         :root_pos: [num_envs, num_robots, 3]
+         :root_rot: [num_envs, num_robots, 3]
+         :compliance: [num_envs, num_robots*2]
+         :target_pose: [num_envs, num_robots*2, 3]"""
+        self.optim.zero_grad()
+
+        eef_pos, foot_pos, foot_rot = self.forward_kinematics(joint_angles, root_pos, root_rot)
+        eef_pos_scaled_flat = (eef_pos.view(num_envs, -1, 3) - self.real_com) * self.scale + self.com
+        # Compute expected loss
+        target_pose_extended = target_pose.repeat(len(self.pregrasp_coefficients),1,1)
+        pregrasp_tip_pose_extended = eef_pos_scaled_flat.repeat(len(self.pregrasp_coefficients),1,1) #[e1,e2,e3,e4,e1,e2,e3,e4, ...]
+        pregrasp_coeffs = self.pregrasp_coefficients.repeat_interleave(num_envs,dim=0)
+        all_tip_pose = target_pose_extended + pregrasp_coeffs.view(-1, 4, 1) * (pregrasp_tip_pose_extended - target_pose_extended)
+        l, margin, R, t, contact_prob = self.spring_grasp_loss(all_tip_pose, # [num_envs*num_coeffs, 4, 3]
+                                      target_pose_extended, 
+                                      compliance.repeat(len(self.pregrasp_coefficients), 1), friction_mu, gpis)
+
+        interp = torch.linspace(0, 1, self.num_samples).to(device).view(1, self.num_samples, 1, 1)
+        delta_vector = (eef_pos_scaled_flat - target_pose).unsqueeze(1).repeat(1, self.num_samples, 1, 1) * interp
+        sample_points = target_pose.unsqueeze(1).repeat(1, self.num_samples, 1, 1) + delta_vector
+        sample_dist, sample_var = gpis.pred(sample_points.view(-1,4,3))
+        sample_prob = (1/torch.sqrt(sample_var))*torch.exp(-sample_dist**2 / (2 * sample_var)) #[num_envs * num_samples, 4, 1]
+        sample_prob = sample_prob.view(-1, self.num_samples, 4, 1)
+        # Normalize sample probability
+        normalization_factor = sample_prob.sum(dim=1) # [num_envs, 4, 1]
+        sample_prob = sample_prob / normalization_factor.unsqueeze(1) 
+        
+        contact_prob = (contact_prob.unsqueeze(2) / normalization_factor).unsqueeze(1) # [num_envs, 1, 4, 1]
+        total_prominence = (contact_prob - sample_prob).sum(dim=1).squeeze(-1) # [num_envs, 4]
+        prominence_loss = total_prominence.sum(dim=1) # NOTE: Variance loss
+        total_loss = -prominence_loss * self.w_uncer # NOTE: Variance loss
+        self.R, self.t = R, t
+        task_loss = l
+        total_loss += task_loss
+        self.total_margin = (self.pregrasp_weights.view(-1,1,1) * margin.view(-1, num_envs, 4)).sum(dim=0)
+        pre_dist, _ = gpis.pred(eef_pos_scaled_flat)
+        pre_dist_loss = -pre_dist.sum(dim=1) * 50.0 # NOTE: Experimental
+        total_loss += pre_dist_loss # Ignored for now
+        total_loss += self.kinematic_loss(joint_angles, foot_pos, root_rot, root_pos, foot_rot)
+        self.total_loss = total_loss
+        loss = total_loss.sum() # TODO: TO BE FINISHED
+        loss.backward()
+        return loss
+    
+    def optimize(self, init_joint_angles, init_root_pos, init_root_rot, target_poses, compliance, friction_mu, gpis, verbose=True):
+        """
+        :init_joint_angles: [num_envs, num_robots, num_dofs]
+        :init_root_pos: [num_envs, num_robots, 3]
+        :init_root_rot: [num_envs, num_robots, 3]
+        :target_poses: [num_envs, num_robots*2, 3] pre-scale
+        :compliance: [num_envs, num_robots*2]
+        :friction_mu: scalar
+        :gpis: GPIS model
+        """
+        joint_angles = init_joint_angles.clone().requires_grad_(True)
+        root_pos = init_root_pos.clone().requires_grad_(True)
+        root_rot = init_root_rot.clone().requires_grad_(True)
+        compliance = compliance.clone().requires_grad_(True)
+        params_list = [{"params":joint_angles, "lr":1e-2}]
+        params_list.append({"params":root_pos, "lr":1e-3})
+        params_list.append({"params":root_rot, "lr":1e-3})
+        params_list.append({"params":compliance, "lr":0.5})
+        
+        target_poses = (target_poses.clone() - self.real_com) * self.scale + self.com
+        params_list.append({"params":target_poses, "lr":2e-3})
+
+        self.optim = torch.optim.AdamW(params_list)
+
+        num_envs = init_joint_angles.shape[0]
+        opt_joint_angles = init_joint_angles.clone()
+        opt_root_pos = root_pos.clone()
+        opt_root_rot = root_rot.clone()
+        opt_compliance = compliance.clone()
+        opt_target_poses = target_poses.clone()
+        opt_value = torch.inf * torch.ones(num_envs).double().to(device)
+        opt_margin = torch.zeros(num_envs, 4).double().to(device)
+        opt_R, opt_t = torch.zeros(num_envs, 3, 3).double().to(device), torch.zeros(num_envs, 3).double().to(device)
+        start_ts = time.time()
+        for s in range(self.num_iters):
+            if isinstance(self.optim, torch.optim.LBFGS):
+                self.optim.step(partial(
+                    self.closure, joint_angles=joint_angles,
+                    root_pos=root_pos,
+                    root_rot=root_rot,
+                    compliance=compliance,
+                    target_pose=target_poses,
+                    friction_mu=friction_mu,
+                    gpis=gpis, num_envs=num_envs))   
+            else:
+                loss = self.closure(joint_angles, root_pos, root_rot, compliance, target_poses, friction_mu, gpis, num_envs)
+            if verbose:
+                print(f"Step {s} Loss:",float(self.total_loss.mean()))
+            if torch.isnan(self.total_loss.sum()):
+                print("NaN detected:", joint_angles, self.total_margin)
+            with torch.no_grad():
+                update_flag = self.total_loss < opt_value
+                if update_flag.sum() and s>20:
+                    opt_value[update_flag] = self.total_loss[update_flag].clone()
+                    opt_joint_angles[update_flag] = joint_angles[update_flag].clone()
+                    opt_root_pos[update_flag] = root_pos[update_flag].clone()
+                    opt_root_rot[update_flag] = root_rot[update_flag].clone()
+                    opt_compliance[update_flag] = compliance[update_flag].clone()
+                    opt_target_poses[update_flag] = target_poses[update_flag].clone()
+                    opt_R[update_flag] = self.R[update_flag].clone()
+                    opt_t[update_flag] = self.t[update_flag].clone()
+            if not isinstance(self.optim, torch.optim.LBFGS):
+                self.optim.step()
+            with torch.no_grad():
+                compliance.clamp_(min=20.0) # prevent negative compliance
+        print("Optimization time:", time.time() - start_ts)
+        print("Margin:",opt_margin)
+        # Scale back opt_target_poses
+        opt_target_poses = (opt_target_poses - self.com) / self.scale + self.real_com
+        return opt_joint_angles, opt_root_pos, opt_root_rot, opt_compliance, opt_target_poses, opt_margin, opt_R, opt_t
+
             
