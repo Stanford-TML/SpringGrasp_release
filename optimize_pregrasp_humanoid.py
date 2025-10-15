@@ -38,7 +38,7 @@ if __name__ == "__main__":
     import json
 
     parser = ArgumentParser()
-    parser.add_argument("--num_iters", type=int, default=200)
+    parser.add_argument("--num_iters", type=int, default=1000)
     parser.add_argument("--exp_name", type=str, required=True)
     parser.add_argument("--pcd_file", type=str, default=None)
     parser.add_argument("--mode", type=str, default="sp") # fc
@@ -86,20 +86,23 @@ if __name__ == "__main__":
         np.savez(f"gpis_states/{args.exp_name}_gpis.npz", mean=test_mean, var=test_var, normal=test_normal, ub=ub, lb=lb)
     
     init_joint_angles = torch.zeros(29).unsqueeze(0).float().to(device)
-    init_joint_angles[:,[0,6]] = -0.312
-    init_joint_angles[:,[3,9]] = 0.669
-    init_joint_angles[:,[4,10]] = -0.363
-    
-    
-    
-    compliance = torch.tensor([[80.0,80.0,80.0,160.0]]).to(device)
+    init_joint_angles[:,[0,6]] = -0.312 - 0.2
+    init_joint_angles[:,[3,9]] = 0.669 + 0.4
+    init_joint_angles[:,[4,10]] = -0.363 - 0.2
+    init_joint_angles[:,16] = 0.5
+    init_joint_angles[:,23] = -0.5
+    init_joint_angles[:,[18,25]] = 0.5
+
+    compliance = torch.tensor([[80.0,80.0,80.0,80.0]]).to(device)
     friction_mu = args.friction
 
 
     grasp_optimizer = HumanoidSpringGraspOptimizer(
                                                 ref_q = init_joint_angles[0].clone(),
                                                 num_iters=args.num_iters,
-                                                mass=args.mass, com=gpis.center[:3],scale=scale,
+                                                mass=args.mass, 
+                                                com=gpis.center[:3],
+                                                scale=scale,
                                                 gravity=False,
                                                 weight_config=weight_config)
     num_guesses = 30
@@ -107,29 +110,49 @@ if __name__ == "__main__":
     init_joint_angles += torch.randn_like(init_joint_angles)*0.2
     init_joint_angles = init_joint_angles.view(num_guesses//2,2,-1)
 
-    init_root_pos = torch.randn((num_guesses//2,2,3)).to(device)+torch.tensor(gpis.center).to(device)
-    init_root_pos[...,2] = 0.8
-    init_root_heading = init_root_pos[..., :2] - torch.tensor(real_center[:2]).to(device)
+    init_root_pos = torch.randn((num_guesses//2,2,3)).to(device)*0.5+torch.tensor(real_center).to(device)
+    init_root_pos[:,1,:] = -init_root_pos[:,0,:]
+    init_root_pos[...,2] = 0.35
+    init_root_heading = torch.tensor(real_center[:2]).to(device) - init_root_pos[..., :2]
     init_root_yaw = torch.atan2(init_root_heading[...,1], init_root_heading[...,0])
     init_root_rot = torch.zeros((num_guesses//2,2,3)).to(device)
     init_root_rot[...,2] = init_root_yaw
 
-    init_tip_pose,_,_ = grasp_optimizer.forward_kinematics(init_joint_angles, init_root_pos, init_root_rot)
+    init_tip_pose = grasp_optimizer.forward_kinematics(init_joint_angles, init_root_pos, init_root_rot)
     init_tip_pose = init_tip_pose.view(-1,4,3)
     #target_pose = target_pose.repeat_interleave(num_guesses,dim=0)
     compliance = compliance.repeat_interleave(num_guesses//2,dim=0)
 
-    target_pose = init_tip_pose.mean(dim=1, keepdim=True).repeat(1,4,1)
-    target_pose = target_pose + (init_tip_pose - target_pose) * 0.3
+    init_target_poses = init_tip_pose.mean(dim=1, keepdim=True).repeat(1,4,1)
+    init_target_poses = init_target_poses + (init_tip_pose - init_target_poses) * 0.3
     if args.vis_gpis:
         for i in range(init_tip_pose.shape[0]):
-            tips, targets, arrows = vis_grasp(init_tip_pose[i], target_pose[i])
+            tips, targets, arrows = vis_grasp(init_tip_pose[i], init_target_poses[i])
             o3d.visualization.draw_geometries([pcd, *tips, *targets, *arrows])
     
+    grasp_vis = HumanoidVisualizer(robot_urdf="assets/g1/g1_29dof_rev_1_0.urdf", num_humanoid=2, env_pcd=pcd)
+
+    # grasp_vis.visualize_robot(init_joint_angles[0,0].detach().cpu().numpy(),
+    #                           np.hstack([init_root_pos[0,0].detach().cpu().numpy(),
+    #                           init_root_rot[0,0].detach().cpu().numpy()]), 
+    #                           init_target_poses[0,:2].detach().cpu().numpy(), robot_id=0)
+    # grasp_vis.cleanup()
+    # visualize initial guesses
+    # for i in range(init_tip_pose.shape[0]):
+    #     grasp_vis.visualize_robot(init_joint_angles[i,0].detach().cpu().numpy(), 
+    #                               np.concatenate([init_root_pos[i,0].detach().cpu().numpy(), init_root_rot[i,0].detach().cpu().numpy()]), 
+    #                               init_target_poses[i,:2].detach().cpu().numpy(), robot_id=0)
+    #     grasp_vis.visualize_robot(init_joint_angles[i,1].detach().cpu().numpy(), 
+    #                               np.concatenate([init_root_pos[i,1].detach().cpu().numpy(), init_root_rot[i,1].detach().cpu().numpy()]), 
+    #                               init_target_poses[i,2:].detach().cpu().numpy(), robot_id=1)
+    #     grasp_vis.cleanup()
+    #     tips, targets, arrows = vis_grasp(init_tip_pose[i], init_target_poses[i])
+    #     o3d.visualization.draw_geometries([pcd, *tips, *targets, *arrows])
+
     opt_joint_angles, opt_root_pos, opt_root_rot, opt_stiffness, opt_target_poses, opt_margin, opt_R, opt_t = grasp_optimizer.optimize(init_joint_angles, 
                                                                                                                                         init_root_pos,
                                                                                                                                         init_root_rot,
-                                                                                                                                        target_pose, 
+                                                                                                                                        init_target_poses, 
                                                                                                                                         compliance, 
                                                                                                                                         friction_mu, 
                                                                                                                                         gpis, verbose=True)
@@ -145,10 +168,9 @@ if __name__ == "__main__":
     floor = o3d.geometry.TriangleMesh.create_box(width=0.5, height=0.5, depth=0.01).translate([-0.25,-0.25,-0.01])
     idx_list = []
     print("Optimal compliance:", opt_stiffness)
-    opt_tip_pose,_,_ = grasp_optimizer.forward_kinematics(opt_joint_angles, opt_root_pos, opt_root_rot)
+    opt_tip_pose = grasp_optimizer.forward_kinematics(opt_joint_angles, opt_root_pos, opt_root_rot)
     opt_tip_pose = opt_tip_pose.view(-1,4,3)
 
-    grasp_vis = HumanoidVisualizer(robot_urdf="assets/g1/g1_29dof_rev_1_0.urdf", num_humanoid=2, env_pcd=pcd)
 
     for i in range(opt_tip_pose.shape[0]):
         if opt_margin[i].min() > 0.0:

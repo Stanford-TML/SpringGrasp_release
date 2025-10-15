@@ -114,9 +114,9 @@ if __name__ == "__main__":
     # Visualize target and tip pose
 
     # scale back
-    opt_tip_pose = (opt_tip_pose - torch.tensor([center[0], center[1], 0.0]).to(device)) / scale + torch.tensor([center[0], center[1], 0.0]).to(device)
-    opt_target_pose = (opt_target_pose - torch.tensor([center[0], center[1], 0.0]).to(device)) / scale + torch.tensor([center[0], center[1], 0.0]).to(device)
-    
+    opt_tip_pose = (opt_tip_pose - torch.tensor([gpis.center[0], gpis.center[1], 0.0]).to(device)) / scale + torch.tensor([center[0], center[1], 0.0]).to(device)
+    opt_target_pose = (opt_target_pose - torch.tensor([gpis.center[0], gpis.center[1], 0.0]).to(device)) / scale + torch.tensor([center[0], center[1], 0.0]).to(device)
+
     pcd.colors = o3d.utility.Vector3dVector(np.array([0.0, 0.0, 1.0] * len(pcd.points)).reshape(-1,3))
     
 

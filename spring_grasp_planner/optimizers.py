@@ -1242,7 +1242,7 @@ class HumanoidSpringGraspOptimizer:
                  num_iters=200,
                  ref_q=None,
                  num_robots=2,
-                 pregrasp_coefficients = [[0.7,0.7,0.7,0.7]],
+                 pregrasp_coefficients = [[0.9,0.9,0.9,0.9]],
                  pregrasp_weights = [1.0],
                  mass = 0.1, com = [0.0, 0.0, 0.0], scale=1.0, gravity=True, # com is post scaled
                  num_samples = 10,
@@ -1254,6 +1254,7 @@ class HumanoidSpringGraspOptimizer:
         self.ref_q = torch.tensor(ref_q).to(device)
         self.eef_ids = HumanoidModel.names_to_indices(eef_link_names)
         self.foot_ids = HumanoidModel.names_to_indices(foot_link_names)
+        self.body_kp_ids = HumanoidModel.names_to_indices(["torso","left_elbow","right_elbow"])
         self.robot_model = HumanoidModel()
         self.loss_weights = loss_weights
         self.num_robots = num_robots
@@ -1263,7 +1264,8 @@ class HumanoidSpringGraspOptimizer:
         self.pregrasp_weights = torch.tensor(pregrasp_weights).double().to(device)
         self.mass = mass
         self.com = torch.tensor(com).to(device)
-        self.real_com = torch.tensor(com).to(device) / scale
+        self.scale_center = torch.tensor([com[0], com[1], 0.0]).to(device)
+        self.real_com = (self.com - self.scale_center) / scale + self.scale_center
         self.scale = scale
         self.gravity = gravity
         self.num_samples = num_samples
@@ -1296,7 +1298,7 @@ class HumanoidSpringGraspOptimizer:
         print("w_force:", self.w_force)
         print("=====================================")
 
-    def forward_kinematics(self, joint_angles, root_pos, root_rot):
+    def forward_kinematics(self, joint_angles, root_pos, root_rot, return_raw=False):
         """
         :params: joint_angles: [num_envs, num_robots, num_dofs]
         :params: root_pos: [num_envs, num_robots, 3]
@@ -1313,13 +1315,15 @@ class HumanoidSpringGraspOptimizer:
 
         link_poses, link_rots = self.robot_model.compute_forward_kinematics(joint_angles_, root_pos_, root_rot_)
         eef_pos = link_poses[:,self.eef_ids,:] + (link_rots[:,self.eef_ids,:,:] @ HumanoidOptimizer.EEF_OFFSETS.view(1,len(self.eef_ids),3,1)).squeeze(-1)
-        foot_pos = link_poses[:,self.foot_ids,:]
-        foot_orn = link_rots[:,self.foot_ids,:,:]
+        
         if joint_angles.dim() == 3:
             eef_pos = eef_pos.view(joint_angles.shape[0],self.num_robots, len(self.eef_ids), 3)
-            foot_pos = foot_pos.view(joint_angles.shape[0],self.num_robots, len(self.foot_ids), 3)
-            foot_orn = foot_orn.view(joint_angles.shape[0],self.num_robots, len(self.foot_ids), 3, 3)
-        return eef_pos, foot_pos, foot_orn
+            link_poses = link_poses.view(joint_angles.shape[0], self.num_robots, -1, 3)
+            link_rots = link_rots.view(joint_angles.shape[0], self.num_robots, -1, 3, 3)
+        if return_raw:
+            return eef_pos, link_poses, link_rots
+        else:
+            return eef_pos
 
     def compute_contact_margin(self, tip_pose, target_pose, current_normal, friction_mu):
         force_dir = tip_pose - target_pose
@@ -1433,8 +1437,10 @@ class HumanoidSpringGraspOptimizer:
          :target_pose: [num_envs, num_robots*2, 3]"""
         self.optim.zero_grad()
 
-        eef_pos, foot_pos, foot_rot = self.forward_kinematics(joint_angles, root_pos, root_rot)
-        eef_pos_scaled_flat = (eef_pos.view(num_envs, -1, 3) - self.real_com) * self.scale + self.com
+        eef_pos, link_poses, link_rots = self.forward_kinematics(joint_angles, root_pos, root_rot, return_raw=True)
+        foot_pos = link_poses[:, :, self.foot_ids, :]
+        foot_rot = link_rots[:, :, self.foot_ids, :, :]
+        eef_pos_scaled_flat = (eef_pos.view(num_envs, -1, 3) - self.scale_center) * self.scale + self.scale_center
         # Compute expected loss
         target_pose_extended = target_pose.repeat(len(self.pregrasp_coefficients),1,1)
         pregrasp_tip_pose_extended = eef_pos_scaled_flat.repeat(len(self.pregrasp_coefficients),1,1) #[e1,e2,e3,e4,e1,e2,e3,e4, ...]
@@ -1465,6 +1471,15 @@ class HumanoidSpringGraspOptimizer:
         pre_dist, _ = gpis.pred(eef_pos_scaled_flat)
         pre_dist_loss = -pre_dist.sum(dim=1) * 50.0 # NOTE: Experimental
         total_loss += pre_dist_loss # Ignored for now
+
+        root_dist,_ = gpis.pred((root_pos-self.scale_center)*self.scale + self.scale_center)
+        root_dist_loss = 1/root_dist # Need to ensure palm is outside the object.
+        total_loss += root_dist_loss.sum(dim=1)
+
+        torso_dist,_ = gpis.pred((link_poses[:,:,self.body_kp_ids,:].view(num_envs, -1, 3)-self.scale_center)*self.scale + self.scale_center)
+        torso_dist_loss = 1/(torso_dist-0.1*self.scale) # Need to ensure torso is outside the object.
+        total_loss += torso_dist_loss.sum(dim=1) * 0.1
+
         total_loss += self.kinematic_loss(joint_angles, foot_pos, root_rot, root_pos, foot_rot)
         self.total_loss = total_loss
         loss = total_loss.sum() # TODO: TO BE FINISHED
@@ -1485,12 +1500,12 @@ class HumanoidSpringGraspOptimizer:
         root_pos = init_root_pos.clone().requires_grad_(True)
         root_rot = init_root_rot.clone().requires_grad_(True)
         compliance = compliance.clone().requires_grad_(True)
-        params_list = [{"params":joint_angles, "lr":1e-2}]
-        params_list.append({"params":root_pos, "lr":1e-3})
+        params_list = [{"params":joint_angles, "lr":2e-2}]
+        params_list.append({"params":root_pos, "lr":1e-2})
         params_list.append({"params":root_rot, "lr":1e-3})
         params_list.append({"params":compliance, "lr":0.5})
         
-        target_poses = (target_poses.clone() - self.real_com) * self.scale + self.com
+        target_poses = (target_poses.clone() - self.scale_center) * self.scale + self.scale_center
         params_list.append({"params":target_poses, "lr":2e-3})
 
         self.optim = torch.optim.AdamW(params_list)
@@ -1525,6 +1540,7 @@ class HumanoidSpringGraspOptimizer:
                 update_flag = self.total_loss < opt_value
                 if update_flag.sum() and s>20:
                     opt_value[update_flag] = self.total_loss[update_flag].clone()
+                    opt_margin[update_flag] = self.total_margin[update_flag].clone()
                     opt_joint_angles[update_flag] = joint_angles[update_flag].clone()
                     opt_root_pos[update_flag] = root_pos[update_flag].clone()
                     opt_root_rot[update_flag] = root_rot[update_flag].clone()
@@ -1539,7 +1555,7 @@ class HumanoidSpringGraspOptimizer:
         print("Optimization time:", time.time() - start_ts)
         print("Margin:",opt_margin)
         # Scale back opt_target_poses
-        opt_target_poses = (opt_target_poses - self.com) / self.scale + self.real_com
+        opt_target_poses = (opt_target_poses - self.scale_center) / self.scale + self.scale_center
         return opt_joint_angles, opt_root_pos, opt_root_rot, opt_compliance, opt_target_poses, opt_margin, opt_R, opt_t
 
             

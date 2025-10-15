@@ -54,6 +54,9 @@ class HumanoidVisualizer:
         self.floor_id = pb.loadURDF("plane.urdf", useFixedBase=True)
         if env_pcd is not None:
             self.env_pcd = env_pcd
+            # Check if point cloud have color
+            if not self.env_pcd.has_colors():
+                self.env_pcd.colors = o3d.utility.Vector3dVector(np.ones((len(self.env_pcd.points),3))*0.5)
             pb.addUserDebugPoints(np.asarray(self.env_pcd.points),
                                   np.asarray(self.env_pcd.colors),
                                   pointSize=5)
